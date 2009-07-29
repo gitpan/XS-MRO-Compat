@@ -3,7 +3,7 @@ package Module::Install::XSUtil;
 
 use 5.005_03;
 
-$VERSION = '0.02';
+$VERSION = '0.04';
 
 use Module::Install::Base;
 @ISA     = qw(Module::Install::Base);
@@ -18,6 +18,7 @@ use File::Find;
 use constant _VERBOSE => $ENV{MI_VERBOSE} ? 1 : 0;
 
 my %BuildRequires = (
+	'Devel::PPPort'     => 3.19,
 	'ExtUtils::ParseXS' => 2.20,
 	'XSLoader'          => 0.08,
 );
@@ -58,12 +59,14 @@ sub use_ppport{
 		use Devel::PPPort;
 		Devel::PPPort::WriteFile(q{$filename});
 		1;
-	} or warn("Cannot write $filename: $@");
+	} or warn("Cannot create $filename: $@");
 
-	$self->clean_files($filename);
-	$self->cc_append_to_ccflags('-DUSE_PPPORT');
-	$self->cc_append_to_inc('.');
-
+	
+	if(-e $filename){
+		$self->clean_files($filename);
+		$self->cc_append_to_ccflags('-DUSE_PPPORT');
+		$self->cc_append_to_inc('.');
+	}
 	return;
 }
 
@@ -77,7 +80,7 @@ sub cc_warnings{
 	}
 	elsif($Config{cc} =~ /\A cl \b /xmsi){
 		# Microsoft Visual C++ Compiler
-		$self->cc_append_to_ccflags('-Wall');
+		$self->cc_append_to_ccflags('-W3');
 	}
 	else{
 		# TODO: support other compilers
@@ -143,14 +146,9 @@ sub cc_append_to_ccflags{
 	$self->_xs_initialize();
 
 	my $mm    = $self->makemaker_args;
-	my $flags = join q{ }, @ccflags;
-
-	if($mm->{CCFLAGS}){
-		$mm->{CCFLAGS} .=  q{ } . $flags;
-	}
-	else{
-		$mm->{CCFLAGS}  = $flags;
-	}
+	
+	$mm->{CCFLAGS} ||= $Config{ccflags};
+	$mm->{CCFLAGS}  .= q{ } . join q{ }, @ccflags;
 	return;
 }
 
@@ -165,27 +163,25 @@ sub requires_xs{
 	my(@inc, @libs);
 
 	while(my $module = each %added){
-		my $dir = File::Spec->join(split /::/, $module);
+		my $mod_basedir = File::Spec->join(split /::/, $module);
 
 		SCAN_INC: foreach my $inc_dir(@INC){
-			my $packlist = File::Spec->join($inc_dir, 'auto', $dir, '.packlist');
-			if(-e $packlist){
-				# read .packlist
+			my $packlist = File::Spec->join($inc_dir, 'auto', $mod_basedir, '.packlist');
+			
+			my $rx_header = qr{\A (.+ $mod_basedir) .+ \.h \z}xmsi;
+			my $rx_lib    = qr{\A (.+ $mod_basedir) .+ (\w+) \. (?: lib | dll | a) \z}xmsi;
 
+			if(-e $packlist){
 				local *IN;
 				open IN, "< $packlist" or die("Cannot open '$packlist' for reading: $!\n");
-
 				while(<IN>){
 					chomp;
 
-					if(/ \.h \z/xmsi){ # header files
-						my($volume, $dir, $basename) = File::Spec->splitpath($_);
-						push @inc, $dir;
+					if($_ =~ $rx_header){
+						push @inc, $1
 					}
-					elsif(/ \. (?: lib | dll | so) \z/xmsi){ # libraries
-						my($volume, $dir, $basename) = File::Spec->splitpath($_);
-						$basename =~ s/ \. \w+ \z //xms; # remove suffix
-						push @libs, [$basename, $dir];
+					elsif($_ =~ $rx_lib){
+						push @libs, [$2, $1];
 					}
 				}
 
@@ -195,16 +191,19 @@ sub requires_xs{
 			}
 			elsif($inc_dir =~ /\b blib \b/xmsi){
 				print "scanning $inc_dir\n";
-				foreach my $path( File::Spec->join($inc_dir, 'auto', $dir), File::Spec->join($inc_dir, $dir) ){
-					find(sub{
-						if(/ \.h \z/xmsi){ # header files
-							push @inc, $path;
-						}
-						elsif(/ \. (?: lib | dll | so ) \z/xmsi){ # libraries
-							(my $name = $_) =~ s/ \. \w+ \z //xms; # remove suffix
-							push @libs, [$name, $path];
-						}
-					}, $path);
+				my $n_inc = scalar @inc;
+
+				find(sub{
+					if($File::Find::name =~ $rx_header){
+						push @inc, $1;
+					}
+					elsif($File::Find::name =~ $rx_lib){
+						push @libs, [$2, 1];
+					}
+				}, File::Spec->join($inc_dir, 'auto', $mod_basedir), File::Spec->join($inc_dir, $mod_basedir));
+
+				if($n_inc != scalar @inc){
+					last SCAN_INC;
 				}
 			}
 		}
@@ -299,8 +298,6 @@ sub install_headers{
 	my @not_found;
 	my $h_map = $self->{xsu_header_map} || {};
 
-	my $name = (split /(?:-|::)/, $self->module_name || $self->name)[-1];
-
 	while(my($ident, $path) = each %{$h_files}){
 		$path ||= $h_map->{$ident} || File::Spec->join('.', $ident);
 
@@ -309,11 +306,9 @@ sub install_headers{
 			next;
 		}
 
-		$ToInstall{$path} = File::Spec->join('$(INST_LIBDIR)', $name, $path);
+		$ToInstall{$path} = File::Spec->join('$(INST_ARCHAUTODIR)', $ident);
 
-		#$self->provides($ident => { file => $path });
-
-		_verbose "install: $ident ($path)" if _VERBOSE;
+		_verbose "install: $path as $ident" if _VERBOSE;
 		$self->_extract_functions_from_header_file($path);
 	}
 
@@ -394,6 +389,7 @@ sub cc_append_to_funclist{
 	my $mm = $self->makemaker_args;
 
 	push @{$mm->{FUNCLIST} ||= []}, @functions;
+	$mm->{DL_FUNCS} ||= { '$(NAME)' => ['boot_$(NAME)'] };
 
 	return;
 }
@@ -437,4 +433,4 @@ sub const_cccmd {
 1;
 __END__
 
-#line 558
+#line 554

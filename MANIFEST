@@ -3,10 +3,8 @@ example/inc/Module/Install.pm
 example/inc/Module/Install/Base.pm
 example/inc/Module/Install/Can.pm
 example/inc/Module/Install/External.pm
-example/inc/Module/Install/Fetch.pm
 example/inc/Module/Install/Makefile.pm
 example/inc/Module/Install/Metadata.pm
-example/inc/Module/Install/Win32.pm
 example/inc/Module/Install/WriteAll.pm
 example/inc/Module/Install/XSUtil.pm
 example/Makefile.PL
@@ -20,11 +18,9 @@ inc/Module/Install/AuthorTests.pm
 inc/Module/Install/Base.pm
 inc/Module/Install/Can.pm
 inc/Module/Install/External.pm
-inc/Module/Install/Fetch.pm
 inc/Module/Install/Makefile.pm
 inc/Module/Install/Metadata.pm
 inc/Module/Install/Repository.pm
-inc/Module/Install/Win32.pm
 inc/Module/Install/WriteAll.pm
 inc/Module/Install/XSUtil.pm
 lib/XS/MRO/Compat.pm
@@ -40,4 +36,3 @@ t/01_test_example.t
 xt/01_podspell.t
 xt/02_pod.t
 xt/03_pod-coverage.t
-xt/04_synopsis.t
