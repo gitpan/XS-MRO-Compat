@@ -3,7 +3,7 @@ package Module::Install::XSUtil;
 
 use 5.005_03;
 
-$VERSION = '0.04';
+$VERSION = '0.07';
 
 use Module::Install::Base;
 @ISA     = qw(Module::Install::Base);
@@ -43,6 +43,16 @@ sub _xs_initialize{
 	return;
 }
 
+# GNU C Compiler
+sub _is_gcc{
+	return $Config{gccversion};
+}
+
+# Microsoft Visual C++ Compiler (cl.exe)
+sub _is_msvc{
+	return $Config{cc} =~ /\A cl \b /xmsi;
+}
+
 sub use_ppport{
 	my($self, $dppp_version) = @_;
 
@@ -75,11 +85,10 @@ sub cc_warnings{
 
 	$self->_xs_initialize();
 
-	if($Config{gccversion}){
+	if(_is_gcc()){
 		$self->cc_append_to_ccflags(qw(-Wall -Wextra));
 	}
-	elsif($Config{cc} =~ /\A cl \b /xmsi){
-		# Microsoft Visual C++ Compiler
+	elsif(_is_msvc()){
 		$self->cc_append_to_ccflags('-W3');
 	}
 	else{
@@ -104,7 +113,7 @@ sub cc_append_to_inc{
 	}
 
 	my $mm    = $self->makemaker_args;
-	my $paths = join q{ }, map{ qq{"-I$_"} } @dirs;
+	my $paths = join q{ }, map{ s{\\}{\\\\}g; qq{"-I$_"} } @dirs;
 
 	if($mm->{INC}){
 		$mm->{INC} .=  q{ } . $paths;
@@ -146,9 +155,24 @@ sub cc_append_to_ccflags{
 	$self->_xs_initialize();
 
 	my $mm    = $self->makemaker_args;
-	
+
 	$mm->{CCFLAGS} ||= $Config{ccflags};
 	$mm->{CCFLAGS}  .= q{ } . join q{ }, @ccflags;
+	return;
+}
+
+sub cc_define{
+	my($self, @defines) = @_;
+
+	$self->_xs_initialize();
+
+	my $mm = $self->makemaker_args;
+	if(exists $mm->{DEFINE}){
+		$mm->{DEFINE} .= q{ } . join q{ }, @defines;
+	}
+	else{
+		$mm->{DEFINE}  = join q{ }, @defines;
+	}
 	return;
 }
 
@@ -164,47 +188,27 @@ sub requires_xs{
 
 	while(my $module = each %added){
 		my $mod_basedir = File::Spec->join(split /::/, $module);
+		my $rx_header = qr{\A ( .+ \Q$mod_basedir\E ) .+ \. h(?:pp)? \z}xmsi;
+		my $rx_lib    = qr{\A ( .+ \Q$mod_basedir\E ) .+ \. (?: lib | dll | a) \z}xmsi;
 
 		SCAN_INC: foreach my $inc_dir(@INC){
-			my $packlist = File::Spec->join($inc_dir, 'auto', $mod_basedir, '.packlist');
-			
-			my $rx_header = qr{\A (.+ $mod_basedir) .+ \.h \z}xmsi;
-			my $rx_lib    = qr{\A (.+ $mod_basedir) .+ (\w+) \. (?: lib | dll | a) \z}xmsi;
+			my @dirs = grep{ -e } File::Spec->join($inc_dir, 'auto', $mod_basedir), File::Spec->join($inc_dir, $mod_basedir);
 
-			if(-e $packlist){
-				local *IN;
-				open IN, "< $packlist" or die("Cannot open '$packlist' for reading: $!\n");
-				while(<IN>){
-					chomp;
+			next SCAN_INC unless @dirs;
 
-					if($_ =~ $rx_header){
-						push @inc, $1
-					}
-					elsif($_ =~ $rx_lib){
-						push @libs, [$2, $1];
-					}
+			my $n_inc = scalar @inc;
+			find(sub{
+				if(my($incdir) = $File::Find::name =~ $rx_header){
+					push @inc, $incdir;
 				}
+				elsif(my($libdir) = $File::Find::name =~ $rx_lib){
+					my($libname) = $_ =~ /\A (?:lib)? (\w+) /xmsi;
+					push @libs, [$libname, $libdir];
+				}
+			}, @dirs);
 
-				close IN;
-
+			if($n_inc != scalar @inc){
 				last SCAN_INC;
-			}
-			elsif($inc_dir =~ /\b blib \b/xmsi){
-				print "scanning $inc_dir\n";
-				my $n_inc = scalar @inc;
-
-				find(sub{
-					if($File::Find::name =~ $rx_header){
-						push @inc, $1;
-					}
-					elsif($File::Find::name =~ $rx_lib){
-						push @libs, [$2, 1];
-					}
-				}, File::Spec->join($inc_dir, 'auto', $mod_basedir), File::Spec->join($inc_dir, $mod_basedir));
-
-				if($n_inc != scalar @inc){
-					last SCAN_INC;
-				}
 			}
 		}
 	}
@@ -268,7 +272,7 @@ sub cc_include_paths{
     foreach my $dir(@dirs){
 		my $prefix = quotemeta( File::Spec->catfile($dir, '') );
 		find(sub{
-			return unless / \.h \z/xms;
+			return unless / \.h(?:pp)? \z/xms;
 
 			(my $h_file = $File::Find::name) =~ s/ \A $prefix //xms;
 			$h_map->{$h_file} = $File::Find::name;
@@ -389,7 +393,7 @@ sub cc_append_to_funclist{
 	my $mm = $self->makemaker_args;
 
 	push @{$mm->{FUNCLIST} ||= []}, @functions;
-	$mm->{DL_FUNCS} ||= { '$(NAME)' => ['boot_$(NAME)'] };
+	$mm->{DL_FUNCS} ||= { '$(NAME)' => [] };
 
 	return;
 }
@@ -419,8 +423,7 @@ sub const_cccmd {
 	my $cccmd  = $self->SUPER::const_cccmd(@_);
 	return q{} unless $cccmd;
 
-	if ($Config{cc} =~ /\A cl \b /xmsi){
-		# Microsoft Visual C++ Compiler
+	if (Module::Install::XSUtil::_is_msvc()){
 		$cccmd .= ' -Fo$@';
 	}
 	else {
@@ -433,4 +436,4 @@ sub const_cccmd {
 1;
 __END__
 
-#line 554
+#line 570
