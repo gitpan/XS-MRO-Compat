@@ -1,5 +1,4 @@
 #line 1
-#line 1
 package Module::Install::External;
 
 # Provides dependency declarations for external non-Perl things

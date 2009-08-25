@@ -1,10 +1,9 @@
 #line 1
-#line 1
 package Module::Install::XSUtil;
 
 use 5.005_03;
 
-$VERSION = '0.07';
+$VERSION = '0.11';
 
 use Module::Install::Base;
 @ISA     = qw(Module::Install::Base);
@@ -30,16 +29,29 @@ sub _verbose{
 	print STDERR q{# }, @_, "\n";
 }
 
+sub _xs_debugging{
+    return $ENV{XS_DEBUG} || scalar( grep{ $_ eq '-g' } @ARGV );
+}
+
 sub _xs_initialize{
 	my($self) = @_;
 
 	unless($self->{xsu_initialized}){
+		$self->{xsu_initialized} = 1;
 
 		$self->requires_external_cc();
 		$self->build_requires(%BuildRequires);
 		$self->makemaker_args(OBJECT => '$(O_FILES)');
 
-		$self->{xsu_initialized} = 1;
+		if($self->_xs_debugging()){
+			# override $Config{optimize}
+			if(_is_msvc()){
+				$self->makemaker_args(OPTIMIZE => '-Zi');
+			}
+			else{
+				$self->makemaker_args(OPTIMIZE => '-g');
+			}
+		}
 	}
 	return;
 }
@@ -98,6 +110,7 @@ sub cc_warnings{
 
 	return;
 }
+
 
 sub cc_append_to_inc{
 	my($self, @dirs) = @_;
@@ -187,10 +200,12 @@ sub requires_xs{
 	my %added = $self->requires(@_);
 	my(@inc, @libs);
 
+	my $rx_lib    = qr{ \. (?: lib | a) \z}xmsi;
+	my $rx_dll    = qr{ \. dll          \z}xmsi; # for Cygwin
+
 	while(my $module = each %added){
 		my $mod_basedir = File::Spec->join(split /::/, $module);
-		my $rx_header = qr{\A ( .+ \Q$mod_basedir\E ) .+ \. h(?:pp)? \z}xmsi;
-		my $rx_lib    = qr{\A ( .+ \Q$mod_basedir\E ) .+ \. (?: lib | dll | a) \z}xmsi;
+		my $rx_header = qr{\A ( .+ \Q$mod_basedir\E ) .+ \. h(?:pp)?     \z}xmsi;
 
 		SCAN_INC: foreach my $inc_dir(@INC){
 			my @dirs = grep{ -e } File::Spec->join($inc_dir, 'auto', $mod_basedir), File::Spec->join($inc_dir, $mod_basedir);
@@ -202,9 +217,15 @@ sub requires_xs{
 				if(my($incdir) = $File::Find::name =~ $rx_header){
 					push @inc, $incdir;
 				}
-				elsif(my($libdir) = $File::Find::name =~ $rx_lib){
+				elsif($File::Find::name =~ $rx_lib){
 					my($libname) = $_ =~ /\A (?:lib)? (\w+) /xmsi;
-					push @libs, [$libname, $libdir];
+					push @libs, [$libname, $File::Find::dir];
+				}
+				elsif($File::Find::name =~ $rx_dll){
+					# XXX: hack for Cygwin
+					my $mm = $self->makemaker_args;
+					$mm->{macro}->{PERL_ARCHIVE_AFTER} ||= '';
+					$mm->{macro}->{PERL_ARCHIVE_AFTER}  .= ' ' . $File::Find::name;
 				}
 			}, @dirs);
 
@@ -227,6 +248,8 @@ sub cc_src_paths{
 	my($self, @dirs) = @_;
 
 	$self->_xs_initialize();
+
+	@dirs = qw(.) unless @dirs;
 
 	my $mm     = $self->makemaker_args;
 
@@ -253,7 +276,7 @@ sub cc_src_paths{
 			_verbose "c: $c" if _VERBOSE;
 		}
 
-		push @{$C_ref}, $c;
+		push @{$C_ref}, $c unless grep{ $_ eq $c } @{$C_ref};
 	}
 
 	$self->cc_append_to_inc('.');
@@ -305,6 +328,7 @@ sub install_headers{
 
 	while(my($ident, $path) = each %{$h_files}){
 		$path ||= $h_map->{$ident} || File::Spec->join('.', $ident);
+		$path   = File::Spec->canonpath($path);
 
 		unless($path && -e $path){
 			push @not_found, $ident;
@@ -324,36 +348,47 @@ sub install_headers{
 	return;
 }
 
+my $home_directory;
 
-# NOTE:
-# This function tries to extract C functions from header files.
-# Using heuristic methods, not a smart parser.
 sub _extract_functions_from_header_file{
 	my($self, $h_file) = @_;
 
 	my @functions;
 
+	($home_directory) = <~> unless defined $home_directory;
+
+	# get header file contents through cpp(1)
 	my $contents = do {
-		local *IN;
-		local $/;
-		open IN, "< $h_file" or die "Cannot open $h_file: $!";
-		scalar <IN>;
+		my $mm = $self->makemaker_args;
+
+		my $cppflags = q{"-I}. File::Spec->join($Config{archlib}, 'CORE') . q{"};
+		$cppflags    =~ s/~/$home_directory/g;
+
+		$cppflags   .= ' ' . $mm->{INC} if $mm->{INC};
+
+		$cppflags   .= ' ' . ($mm->{CCFLAGS} || $Config{ccflags});
+		$cppflags   .= ' ' . $mm->{DEFINE} if $mm->{DEFINE};
+
+		my $add_include = _is_msvc() ? '-FI' : '-include';
+		$cppflags   .= ' ' . join ' ', map{ qq{$add_include "$_"} } qw(EXTERN.h perl.h XSUB.h);
+
+		my $cppcmd = qq{$Config{cpprun} $cppflags $h_file};
+
+		_verbose("extract functions from: $cppcmd") if _VERBOSE;
+		`$cppcmd`;
 	};
 
-	# remove C comments
-	$contents =~ s{ /\* .*? \*/ }{}xmsg;
+	unless(defined $contents){
+		die "Cannot call C pre-processor ($Config{cpprun}): $! ($?)";
+	}
 
-	# remove cpp directives
+	# remove other include file contents
+	my $chfile = q/\# (?:line)? \s+ \d+/;
 	$contents =~ s{
-		\# \s* \w+
-			(?: [^\n]* \\ [\n])*
-			[^\n]* [\n]
-	}{}xmsg;
-
-	# register keywords
-	my %skip;
-	@skip{qw(if while for int void unsignd float double bool char)} = ();
-
+		^$chfile  \s+ (?! "\Q$h_file\E" ) .* $
+		.*
+		^(?= $chfile)
+	}{}xmsig;
 
 	while($contents =~ m{
 			([^\\;\s]+                # type
@@ -361,27 +396,28 @@ sub _extract_functions_from_header_file{
 			([a-zA-Z_][a-zA-Z0-9_]*)  # function name
 			\s*
 			\( [^;#]* \)              # argument list
-			[^;]*                     # attributes or something
+			[\w\s\(\)]*               # attributes or something
 			;)                        # end of declaration
 		}xmsg){
 			my $decl = $1;
 			my $name = $2;
 
-			next if exists $skip{$name};
-			next if $name eq uc($name);  # maybe macros
-
-			next if $decl =~ /\b typedef \b/xmsi;
-
-			next if $decl =~ /\b [0-9]+ \b/xmsi; # integer literals
-			next if $decl =~ / ["'] /xmsi;       # string/char literals
-			#"
+			next if $decl =~ /\b typedef \b/xms;
+			next if $name =~ /^_/xms; # skip something private
 
 			push @functions, $name;
 
-			_verbose "function: $name" if _VERBOSE;
+			if(_VERBOSE){
+				$decl =~ tr/\n\r\t / /s;
+				$decl =~ s/ (\Q$name\E) /<$name>/xms;
+				_verbose("decl: $decl");
+			}
 	}
 
-	$self->cc_append_to_funclist(@functions) if @functions;
+	if(@functions){
+		$self->cc_append_to_funclist(@functions);
+	}
+
 	return;
 }
 
@@ -437,4 +473,4 @@ sub const_cccmd {
 1;
 __END__
 
-#line 570
+#line 614
